@@ -1,0 +1,4 @@
+dev/.mock-db.json
+.DS_Store
+node_modules/
+.claude/
