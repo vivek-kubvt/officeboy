@@ -25,6 +25,33 @@ export const session = {
     memory = null;
     try {
       localStorage.removeItem(KEY);
+      Object.keys(localStorage).filter((k) => k.startsWith(LAST)).forEach((k) => localStorage.removeItem(k));
+    } catch {}
+  },
+};
+
+const LAST = 'officeboy.last.';
+
+function localDay() {
+  const d = new Date();
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+/** Today's last reply for a screen, so it can show instantly while fresh data loads. */
+export const lastReply = {
+  get(action) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(LAST + action));
+      const s = session.get();
+      return saved && s && saved.who === s.token.slice(0, 12) && saved.day === localDay() ? saved : null;
+    } catch {
+      return null;
+    }
+  },
+  set(action, data) {
+    try {
+      const s = session.get();
+      localStorage.setItem(LAST + action, JSON.stringify({ who: s.token.slice(0, 12), day: localDay(), offset: data.serverNow - Date.now(), data }));
     } catch {}
   },
 };

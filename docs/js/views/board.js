@@ -1,4 +1,4 @@
-import { api } from '../api.js';
+import { api, lastReply } from '../api.js';
 import { h, fill, icon, loading, toast, errorText, timeLabel, dateLabel, untilLabel, poll } from '../ui.js';
 
 /** Office boy's live view: what to prepare for each round and who to deliver to. */
@@ -29,10 +29,11 @@ export async function renderBoard(main, { onAuthError }) {
     }
   }
 
-  function apply(data) {
+  function apply(data, saved) {
     state = data;
-    offset = data.serverNow - Date.now();
-    loadedAt = Date.now();
+    offset = saved ? saved.offset : data.serverNow - Date.now();
+    loadedAt = saved ? 0 : Date.now();
+    if (!saved) lastReply.set('board', data);
     if (!selected || !data.rounds.some((r) => r.id === selected)) selected = data.currentRoundId;
   }
 
@@ -55,7 +56,7 @@ export async function renderBoard(main, { onAuthError }) {
         ),
         h('button', { class: 'btn sm', onclick: load, disabled: refreshing, 'aria-label': 'Refresh' },
           refreshing ? h('span', { class: 'spinner' }) : icon('refresh'),
-          ago < 10 ? 'Updated now' : `${ago < 60 ? `${ago}s` : `${Math.round(ago / 60)} min`} ago`),
+          !loadedAt ? 'Updating' : ago < 10 ? 'Updated now' : `${ago < 60 ? `${ago}s` : `${Math.round(ago / 60)} min`} ago`),
       ),
       failed && h('div', { class: 'notice' }, `Couldn’t refresh: ${errorText(failed)}`),
       h('div', { class: 'stats' },
@@ -157,6 +158,8 @@ export async function renderBoard(main, { onAuthError }) {
     draw();
   }
 
+  const saved = lastReply.get('board');
+  if (saved) apply(saved.data, saved);
   draw();
   await load();
   let ticks = 0;

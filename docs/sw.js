@@ -1,6 +1,7 @@
-// Network-first for the app shell so updates show up immediately; cache is the offline fallback.
+// App files load from the phone's cache instantly and are refreshed in the background, so a new
+// release shows up on the next open. Bump CACHE on every release.
 // API calls go to script.google.com (another origin) and are never cached.
-const CACHE = 'officeboy-v3';
+const CACHE = 'officeboy-v4';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './css/app.css',
   './js/app.js', './js/api.js', './js/ui.js', './js/config.js', './js/platform.js', './js/push.js',
@@ -23,17 +24,22 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== 'GET' || url.origin !== self.location.origin) return;
-  event.respondWith(
-    fetch(event.request)
+  const request = event.request.mode === 'navigate' ? './index.html' : event.request;
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    const cachedResponse = await cache.match(request, { ignoreSearch: true });
+    const network = fetch(event.request)
       .then((response) => {
-        if (response.ok) {
-          const copy = response.clone();
-          caches.open(CACHE).then((cache) => cache.put(event.request, copy));
-        }
+        if (response.ok) cache.put(request, response.clone());
         return response;
       })
-      .catch(async () => (await caches.match(event.request)) || (event.request.mode === 'navigate' ? caches.match('./index.html') : Response.error())),
-  );
+      .catch(() => cachedResponse || Response.error());
+    if (cachedResponse) {
+      event.waitUntil(network);
+      return cachedResponse;
+    }
+    return network;
+  })());
 });
 
 // Push from Firebase (data-only messages sent by Apps Script). Always show a notification:

@@ -1,6 +1,6 @@
 // "Call office boy": the caller's card, and the office boy's ringing screen.
 
-import { api } from '../api.js';
+import { api, lastReply } from '../api.js';
 import { h, fill, icon, toast, openSheet, withBusy, errorText, spinner } from '../ui.js';
 import { enablePush, pushState, pushSupport } from '../push.js';
 import { isIOS } from '../platform.js';
@@ -342,6 +342,7 @@ export function mountCallCard(slot, { features, onAuthError }) {
       const data = await api('myCalls');
       calls = data.calls;
       offset = data.serverNow - Date.now();
+      lastReply.set('myCalls', data);
     } catch (err) {
       if (onAuthError(err)) return;
     }
@@ -409,6 +410,11 @@ export function mountCallCard(slot, { features, onAuthError }) {
     );
   }
 
+  const saved = lastReply.get('myCalls');
+  if (saved) {
+    calls = saved.data.calls;
+    offset = saved.offset;
+  }
   draw();
   load();
   // Check every 6 s while a call is waiting, otherwise every 30 s.

@@ -1,4 +1,4 @@
-import { api } from '../api.js';
+import { api, lastReply } from '../api.js';
 import { mountCallCard } from './calls.js';
 import { h, fill, icon, loading, toast, openSheet, errorText, timeLabel, dateLabel, untilLabel, drinkLabel, greeting, poll } from '../ui.js';
 
@@ -10,6 +10,7 @@ export async function renderToday(main, { onSession, onAuthError }) {
   let offset = 0; // server clock minus device clock
   let busy = null; // key of the action in progress
   let failed = null;
+  let updating = false; // showing the saved copy while fresh data loads
   const callSlot = h('div', { class: 'stack' }); // kept across redraws; manages itself
   let stopCallCard = null;
 
@@ -18,21 +19,26 @@ export async function renderToday(main, { onSession, onAuthError }) {
   async function load() {
     try {
       const data = await api('me');
+      updating = false;
       apply(data);
       onSession(data);
       failed = null;
     } catch (err) {
       if (onAuthError(err)) return;
       failed = err;
+      updating = false;
       if (!state) draw();
+      else toast(`Couldn’t refresh: ${errorText(err)}`, 'error');
     }
   }
 
-  function apply(data) {
+  /** savedOffset is passed when showing the copy saved on this phone. */
+  function apply(data, savedOffset) {
     // Older Apps Script versions don't send feature flags: treat everything as on.
     data.features = { showAttendance: true, allowAutoBook: true, allowRoundChange: true, showCountdown: true, callReasons: [], ...data.features };
     state = data;
-    offset = data.serverNow - Date.now();
+    offset = savedOffset ?? data.serverNow - Date.now();
+    if (savedOffset === undefined) lastReply.set('me', data);
     // Managers the admin allowed to call get the "Call office boy" card.
     const canCall = data.user.canCall && data.features?.callReasons?.length > 0;
     if (canCall && !stopCallCard) stopCallCard = mountCallCard(callSlot, { features: data.features, onAuthError });
@@ -72,7 +78,8 @@ export async function renderToday(main, { onSession, onAuthError }) {
     fill(main, 
       h('section', { class: 'hello stack', style: 'gap:4px' },
         h('h1', {}, `${greeting()}, ${user.name.split(' ')[0]}`),
-        h('p', { class: 'muted' }, dateLabel(state.today)),
+        h('p', { class: 'muted row', style: 'gap:8px' }, dateLabel(state.today),
+          updating && h('span', { class: 'pill' }, h('span', { class: 'spinner', style: 'width:12px;height:12px;border-width:2px' }), 'Updating')),
       ),
       stopCallCard && callSlot,
       state.features.showAttendance && attendanceCard(),
@@ -256,7 +263,11 @@ export async function renderToday(main, { onSession, onAuthError }) {
     }
   }
 
-  draw();
+  const saved = lastReply.get('me');
+  if (saved) {
+    updating = true;
+    apply(saved.data, saved.offset);
+  } else draw();
   await load();
 
   // Redraw every 20 s so countdowns tick and rounds lock on time; re-fetch every minute for changes.

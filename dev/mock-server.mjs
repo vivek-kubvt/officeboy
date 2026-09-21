@@ -101,12 +101,14 @@ const services = {
       getProperty: (k) => db.props[k] ?? null,
       setProperty: (k, v) => { db.props[k] = String(v); },
       setProperties: (o) => Object.entries(o).forEach(([k, v]) => { db.props[k] = String(v); }),
+      getProperties: () => ({ ...db.props }),
       deleteProperty: (k) => { delete db.props[k]; },
     }),
   },
   CacheService: {
     getScriptCache: () => ({
       get: (k) => cache.get(k) ?? null,
+      getAll: (keys) => Object.fromEntries(keys.filter((k) => cache.has(k)).map((k) => [k, cache.get(k)])),
       put: (k, v) => cache.set(k, v),
       remove: (k) => cache.delete(k),
     }),

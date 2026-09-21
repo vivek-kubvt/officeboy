@@ -101,6 +101,7 @@ function doPost(e) {
     const handler = ACTIONS[req.action];
     if (!handler) fail('Unknown action.');
     ensureSchema();
+    warmCache();
     body = { ok: true, data: handler(req) };
   } catch (err) {
     if (!err.expected) console.error(err && err.stack ? err.stack : err);
@@ -122,7 +123,7 @@ function install() {
 
 /** Adds header cells for columns introduced by newer versions of this script. */
 function ensureSchema(force) {
-  const props = PropertiesService.getScriptProperties();
+  const props = scriptProps();
   if (!force && props.getProperty('schemaVersion') === SCHEMA_VERSION) return;
   Object.keys(TABLES).forEach(function (name) {
     const sh = SpreadsheetApp.getActive().getSheetByName(name);
@@ -155,13 +156,13 @@ function setup(req) {
   const admin = newUser({ name: adminName, role: 'admin', desk: '' });
   appendRows('Users', [cells('Users', admin)]);
   setPassword(password);
-  PropertiesService.getScriptProperties().setProperty('ownerId', admin.id);
+  scriptProps().setProperty('ownerId', admin.id);
   return { token: admin.token };
 }
 
 function adminLogin(req) {
   if (!isConfigured()) fail('This office is not set up yet.');
-  const cache = CacheService.getScriptCache();
+  const cache = scriptCache();
   const fails = Number(cache.get('loginFails') || 0);
   if (fails >= 10) fail('Too many wrong attempts. Try again in 15 minutes.');
   if (!checkPassword(req.password)) {
@@ -169,7 +170,7 @@ function adminLogin(req) {
     fail('Wrong password.');
   }
   cache.remove('loginFails');
-  const ownerId = PropertiesService.getScriptProperties().getProperty('ownerId');
+  const ownerId = scriptProps().getProperty('ownerId');
   const admins = loadUsers().filter(function (u) { return u.active && u.role === 'admin'; });
   const owner = admins.filter(function (u) { return u.id === ownerId; })[0] || admins[0];
   if (!owner) fail('No active admin found. Fix the Users tab in the sheet.');
@@ -206,16 +207,16 @@ function withLock(fn) {
 }
 
 function isConfigured() {
-  return !!PropertiesService.getScriptProperties().getProperty('passwordHash');
+  return !!scriptProps().getProperty('passwordHash');
 }
 
 function setPassword(password) {
   const salt = newToken();
-  PropertiesService.getScriptProperties().setProperties({ passwordSalt: salt, passwordHash: hashPassword(password, salt) });
+  scriptProps().setProperties({ passwordSalt: salt, passwordHash: hashPassword(password, salt) });
 }
 
 function checkPassword(password) {
-  const props = PropertiesService.getScriptProperties();
+  const props = scriptProps();
   const salt = props.getProperty('passwordSalt');
   return !!salt && hashPassword(String(password || ''), salt) === props.getProperty('passwordHash');
 }
@@ -682,7 +683,7 @@ function callerLabel(u) {
 }
 
 function callsVersion() {
-  const cache = CacheService.getScriptCache();
+  const cache = scriptCache();
   let v = cache.get('callsVersion');
   if (!v) {
     v = newId();
@@ -692,7 +693,7 @@ function callsVersion() {
 }
 
 function bumpCalls() {
-  CacheService.getScriptCache().put('callsVersion', newId(), 21600);
+  scriptCache().put('callsVersion', newId(), 21600);
 }
 
 // ---------------------------------------------------------------- push notifications (Firebase Cloud Messaging)
@@ -715,11 +716,11 @@ function testPush(req, user) {
 }
 
 function saveFirebase(req, admin) {
-  const props = PropertiesService.getScriptProperties();
+  const props = scriptProps();
   if (req.remove) {
     setSetting('firebase', '');
     props.deleteProperty('fcmServiceAccount');
-    CacheService.getScriptCache().remove('fcmToken');
+    scriptCache().remove('fcmToken');
     return adminData(req, admin);
   }
   const c = req.config || {};
@@ -741,7 +742,7 @@ function saveFirebase(req, admin) {
   if (!sa) fail('Add the service account key file.');
   if (sa.project_id !== config.projectId) fail('The service account belongs to project “' + sa.project_id + '”, but the config is for “' + config.projectId + '”.');
 
-  CacheService.getScriptCache().remove('fcmToken');
+  scriptCache().remove('fcmToken');
   fcmAccessToken(sa); // fails with a clear message if Google rejects the key
   props.setProperty('fcmServiceAccount', JSON.stringify(sa));
   setSetting('firebase', JSON.stringify({ config: config, vapidKey: vapidKey }));
@@ -758,7 +759,7 @@ function firebasePublic() {
 }
 
 function serviceAccount() {
-  const raw = PropertiesService.getScriptProperties().getProperty('fcmServiceAccount');
+  const raw = scriptProps().getProperty('fcmServiceAccount');
   return raw ? JSON.parse(raw) : null;
 }
 
@@ -801,6 +802,7 @@ function sendPush(userIds, message) {
       if (lock.tryLock(5000)) {
         try {
           dead.sort(function (a, b) { return b - a; }).forEach(function (row) { sheet('Devices').deleteRow(row); });
+          tableChanged('Devices');
         } finally {
           lock.releaseLock();
         }
@@ -814,7 +816,7 @@ function sendPush(userIds, message) {
 }
 
 function fcmAccessToken(sa) {
-  const cache = CacheService.getScriptCache();
+  const cache = scriptCache();
   const cached = cache.get('fcmToken');
   if (cached) return cached;
   const now = Math.floor(Date.now() / 1000);
@@ -967,29 +969,17 @@ function finalizeDueRounds(ctx) {
 }
 
 function getFinalized(ctx) {
-  const state = JSON.parse(PropertiesService.getScriptProperties().getProperty('finalized') || '{}');
+  const state = JSON.parse(scriptProps().getProperty('finalized') || '{}');
   return state.date === ctx.today ? state.rounds : [];
 }
 
 function setFinalized(ctx, roundIds) {
-  PropertiesService.getScriptProperties().setProperty('finalized', JSON.stringify({ date: ctx.today, rounds: roundIds }));
+  scriptProps().setProperty('finalized', JSON.stringify({ date: ctx.today, rounds: roundIds }));
 }
 
 // ---------------------------------------------------------------- tables
 
 function loadUsers() {
-  // Every request authenticates, so keep the Users tab in the script cache for a minute.
-  const cache = CacheService.getScriptCache();
-  const cached = cache.get('users:' + SCHEMA_VERSION);
-  if (cached) return JSON.parse(cached);
-  const users = readUsers();
-  try {
-    cache.put('users:' + SCHEMA_VERSION, JSON.stringify(users), 60);
-  } catch (e) {} // over the 100 KB cache limit: just read the sheet each time
-  return users;
-}
-
-function readUsers() {
   return readTable('Users').map(function (u) {
     return {
       _row: u._row, id: str(u.id), name: str(u.name), role: str(u.role), desk: str(u.desk), token: str(u.token),
@@ -1049,18 +1039,105 @@ function sheet(name) {
   return (sheetCache_[name] = sh);
 }
 
-function readTable(name) {
-  const sh = sheet(name);
-  const cols = TABLES[name];
-  const last = sh.getLastRow();
-  if (last < 2) return [];
-  return sh.getRange(2, 1, last - 1, cols.length).getValues()
-    .map(function (v, i) { return toObj(cols, v, i + 2); })
-    .filter(function (o) { return str(o[cols[0]]) !== ''; });
+// ---- Script properties and cache, each read once per request (every call to them costs 20–50 ms).
+
+let props_ = null;
+function scriptProps() {
+  if (props_) return props_;
+  const store = PropertiesService.getScriptProperties();
+  const values = store.getProperties();
+  props_ = {
+    getProperty: function (k) { return Object.prototype.hasOwnProperty.call(values, k) ? values[k] : null; },
+    setProperty: function (k, v) { values[k] = String(v); store.setProperty(k, String(v)); },
+    setProperties: function (o) {
+      Object.keys(o).forEach(function (k) { values[k] = String(o[k]); });
+      store.setProperties(o);
+    },
+    deleteProperty: function (k) { delete values[k]; store.deleteProperty(k); },
+  };
+  return props_;
 }
 
-/** Rows whose first column (a date) is >= fromDate. Reads from the bottom, so it stays fast as the sheet grows. */
+let cache_ = null;
+function scriptCache() {
+  if (cache_) return cache_;
+  const store = CacheService.getScriptCache();
+  const seen = {};
+  cache_ = {
+    get: function (k) { return k in seen ? seen[k] : (seen[k] = store.get(k)); },
+    put: function (k, v, ttl) { seen[k] = v; store.put(k, v, ttl); },
+    remove: function (k) { seen[k] = null; store.remove(k); },
+    /** One round trip for many keys. */
+    prefetch: function (keys) {
+      const missing = keys.filter(function (k) { return !(k in seen); });
+      if (!missing.length) return;
+      const got = store.getAll(missing);
+      missing.forEach(function (k) { seen[k] = got[k] === undefined ? null : got[k]; });
+    },
+  };
+  return cache_;
+}
+
+/** Loads everything a typical request needs from the cache in two round trips. */
+function warmCache() {
+  const keys = ['tz', 'callsVersion'];
+  ['Settings', 'Users', 'Menu', 'Rounds'].forEach(function (t) { keys.push('ver:' + t, 'rows:' + t); });
+  scriptCache().prefetch(keys);
+  const today = Utilities.formatDate(new Date(), timeZone(), 'yyyy-MM-dd');
+  const dayKeys = [];
+  ['Orders', 'Attendance', 'Calls'].forEach(function (t) { dayKeys.push('ver:' + t, 'rows:' + t + '|' + today); });
+  scriptCache().prefetch(dayKeys);
+}
+
+// ---- Read cache. Sheet reads are the slow part of every request (50–150 ms each), so tables are
+// kept in the script cache and in memory for the current request. Every write through this script
+// bumps the table's version, which makes all cached copies of that table stale immediately.
+// Edits made by hand in the sheet show up once the cache expires (CACHE_SECONDS).
+
+const CACHE_SECONDS = 300;
+const memo_ = {};
+
+function cached(table, key, load) {
+  if (memo_[key]) return memo_[key];
+  const cache = scriptCache();
+  const version = cache.get('ver:' + table) || '0';
+  const hit = cache.get('rows:' + key);
+  if (hit) {
+    const entry = JSON.parse(hit);
+    if (entry.v === version) return (memo_[key] = entry.rows);
+  }
+  const rows = load();
+  try {
+    cache.put('rows:' + key, JSON.stringify({ v: version, rows: rows }), CACHE_SECONDS);
+  } catch (e) {} // over the 100 KB cache limit: read the sheet next time
+  return (memo_[key] = rows);
+}
+
+function tableChanged(name) {
+  Object.keys(memo_).forEach(function (k) { if (k.split('|')[0] === name) delete memo_[k]; });
+  scriptCache().put('ver:' + name, newId(), 21600);
+}
+
+function readTable(name) {
+  return cached(name, name, function () {
+    const sh = sheet(name);
+    const cols = TABLES[name];
+    const last = sh.getLastRow();
+    if (last < 2) return [];
+    return sh.getRange(2, 1, last - 1, cols.length).getValues()
+      .map(function (v, i) { return toObj(cols, v, i + 2); })
+      .filter(function (o) { return str(o[cols[0]]) !== ''; });
+  });
+}
+
+/** Rows whose first column (a date) is >= fromDate. Today's rows are cached; older ranges (reports) are not. */
 function readSince(name, fromDate, ctx) {
+  if (fromDate === ctx.today) return cached(name, name + '|' + fromDate, function () { return scanSince(name, fromDate, ctx); });
+  return scanSince(name, fromDate, ctx);
+}
+
+/** Reads from the bottom of the sheet and stops at older dates, so it stays fast as the sheet grows. */
+function scanSince(name, fromDate, ctx) {
   const sh = sheet(name);
   const cols = TABLES[name];
   const found = [];
@@ -1082,9 +1159,6 @@ function readSince(name, fromDate, ctx) {
   return found.reverse();
 }
 
-function tableChanged(name) {
-  if (name === 'Users') CacheService.getScriptCache().remove('users:' + SCHEMA_VERSION);
-}
 
 function writeRow(name, row, values) {
   tableChanged(name);
@@ -1102,6 +1176,7 @@ function appendRows(name, rows) {
 }
 
 function replaceTable(name, rows) {
+  tableChanged(name);
   const sh = sheet(name);
   const last = sh.getLastRow();
   if (last >= 2) sh.getRange(2, 1, last - 1, TABLES[name].length).clearContent();
@@ -1114,8 +1189,17 @@ function cells(name, obj) {
 
 function toObj(cols, values, row) {
   const o = { _row: row };
-  cols.forEach(function (k, i) { o[k] = values[i]; });
+  cols.forEach(function (k, i) { o[k] = plain(k, values[i]); });
   return o;
+}
+
+/** Cells typed by hand in the sheet can come back as Date objects; turn them into the text this script stores. */
+function plain(col, v) {
+  if (!(v instanceof Date)) return v;
+  const tz = timeZone();
+  if (col === 'date') return Utilities.formatDate(v, tz, 'yyyy-MM-dd');
+  if (/Time$/.test(col)) return Utilities.formatDate(v, tz, 'HH:mm');
+  return v.toISOString();
 }
 
 function strip(o) {
@@ -1134,8 +1218,22 @@ function cell(v) {
 
 // ---------------------------------------------------------------- small utils
 
+let timeZone_ = null;
+
+/** The sheet's time zone (File → Settings), cached because asking the spreadsheet is slow. */
+function timeZone() {
+  if (timeZone_) return timeZone_;
+  const cache = scriptCache();
+  timeZone_ = cache.get('tz');
+  if (!timeZone_) {
+    timeZone_ = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+    cache.put('tz', timeZone_, 1800);
+  }
+  return timeZone_;
+}
+
 function context() {
-  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  const tz = timeZone();
   const now = new Date();
   return {
     tz: tz,
