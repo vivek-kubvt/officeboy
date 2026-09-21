@@ -14,6 +14,11 @@
 const SUGAR_OPTIONS = ['Normal', 'Less', 'No sugar'];
 const ROLES = ['admin', 'employee', 'officeboy'];
 const ATTENDANCE = ['office', 'wfh', 'leave'];
+const CALL_REASONS = ['Tea', 'Coffee', 'Water', 'Come to cabin', 'Clean up', 'Snacks'];
+const CALL_ACTIVE = ['open', 'coming'];
+const SCHEMA_VERSION = '2';
+/** Bump when the app needs new backend actions, so admins are told to update Code.gs. */
+const BACKEND_VERSION = 2;
 
 /** Options the admin can show or hide. Stored as JSON in Settings → features. */
 const FEATURE_DEFAULTS = {
@@ -24,15 +29,22 @@ const FEATURE_DEFAULTS = {
   showCountdown: true, // "Booking closes in 20 min" on the employee screen
   showNoReply: true, // office boy sees who hasn't replied
   officeBoyHistory: true, // office boy has the History tab
+  callReasons: CALL_REASONS, // reasons shown on the "Call office boy" card
+  allowCallNote: true, // callers can add a short note
 };
+
+/** Feature keys that hold a list, and the values each list may contain. */
+const FEATURE_LISTS = { sugarOptions: SUGAR_OPTIONS, callReasons: CALL_REASONS };
 
 const TABLES = {
   Settings: ['key', 'value'],
-  Users: ['id', 'name', 'role', 'desk', 'token', 'defaultDrink', 'defaultSugar', 'autoBook', 'active', 'createdAt'],
+  Users: ['id', 'name', 'role', 'desk', 'token', 'defaultDrink', 'defaultSugar', 'autoBook', 'active', 'createdAt', 'title', 'canCall'],
   Menu: ['name', 'hasSugar', 'active'],
   Rounds: ['id', 'name', 'serveTime', 'cutoffTime', 'active'],
   Attendance: ['date', 'userId', 'status', 'updatedAt'],
   Orders: ['date', 'roundId', 'userId', 'drink', 'sugar', 'status', 'updatedAt'],
+  Calls: ['date', 'id', 'userId', 'reason', 'note', 'status', 'createdAt', 'updatedAt', 'handledBy'],
+  Devices: ['userId', 'token', 'platform', 'updatedAt'],
 };
 
 const SEEDS = {
@@ -66,6 +78,14 @@ const ACTIONS = {
   saveSettings: auth(['admin'], withLock(saveSettings)),
   changePassword: auth(['admin'], withLock(changePassword)),
   report: auth(['admin'], report),
+  call: auth(ROLES, placeCall),
+  myCalls: auth(ROLES, myCalls),
+  cancelCall: auth(ROLES, withLock(cancelCall)),
+  calls: auth(['admin', 'officeboy'], callsBoard),
+  updateCall: auth(['admin', 'officeboy'], updateCall),
+  registerDevice: auth(ROLES, withLock(registerDevice)),
+  saveFirebase: auth(['admin'], saveFirebase),
+  testPush: auth(ROLES, testPush),
 };
 
 // ---------------------------------------------------------------- entry points
@@ -80,6 +100,7 @@ function doPost(e) {
     const req = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     const handler = ACTIONS[req.action];
     if (!handler) fail('Unknown action.');
+    ensureSchema();
     body = { ok: true, data: handler(req) };
   } catch (err) {
     if (!err.expected) console.error(err && err.stack ? err.stack : err);
@@ -91,11 +112,23 @@ function doPost(e) {
 /** Run once from the Apps Script editor. Safe to run again. */
 function install() {
   Object.keys(TABLES).forEach(function (name) { sheet(name); });
+  ensureSchema(true);
   ScriptApp.getProjectTriggers()
     .filter(function (t) { return t.getHandlerFunction() === 'finalizeTick'; })
     .forEach(function (t) { ScriptApp.deleteTrigger(t); });
   ScriptApp.newTrigger('finalizeTick').timeBased().everyMinutes(10).create();
   console.log('Installed. Next: Deploy → New deployment → Web app (Execute as: Me, Who has access: Anyone).');
+}
+
+/** Adds header cells for columns introduced by newer versions of this script. */
+function ensureSchema(force) {
+  const props = PropertiesService.getScriptProperties();
+  if (!force && props.getProperty('schemaVersion') === SCHEMA_VERSION) return;
+  Object.keys(TABLES).forEach(function (name) {
+    const sh = SpreadsheetApp.getActive().getSheetByName(name);
+    if (sh) sh.getRange(1, 1, 1, TABLES[name].length).setValues([TABLES[name]]).setFontWeight('bold');
+  });
+  props.setProperty('schemaVersion', SCHEMA_VERSION);
 }
 
 /** Time trigger: writes auto-booked orders into the sheet once a round's cutoff passes. */
@@ -106,7 +139,7 @@ function finalizeTick() {
 // ---------------------------------------------------------------- auth & setup
 
 function status() {
-  return { configured: isConfigured(), officeName: isConfigured() ? getSetting('officeName') : '' };
+  return { configured: isConfigured(), officeName: isConfigured() ? getSetting('officeName') : '', backendVersion: BACKEND_VERSION };
 }
 
 function setup(req) {
@@ -210,8 +243,13 @@ function myDay(user, ctx) {
   const u = day.users.filter(function (x) { return x.id === user.id; })[0] || user;
   const booker = canBook(u);
   return {
-    user: { id: u.id, name: u.name, role: u.role, desk: u.desk, defaultDrink: u.defaultDrink, defaultSugar: u.defaultSugar, autoBook: autoBookOn(day, u) },
+    user: {
+      id: u.id, name: u.name, role: u.role, desk: u.desk, title: u.title, canCall: u.canCall,
+      defaultDrink: u.defaultDrink, defaultSugar: u.defaultSugar, autoBook: autoBookOn(day, u),
+    },
+    firebase: firebasePublic(),
     officeName: getSetting('officeName'),
+    backendVersion: BACKEND_VERSION,
     today: ctx.today,
     serverNow: ctx.nowMs,
     features: day.features,
@@ -372,6 +410,9 @@ function adminData(req, user) {
     rounds: loadRounds(ctx).map(strip),
     sugarOptions: SUGAR_OPTIONS,
     features: loadFeatures(),
+    callReasons: CALL_REASONS,
+    firebase: firebasePublic(),
+    pushServiceAccount: serviceAccountEmail(),
     sheetUrl: SpreadsheetApp.getActive().getUrl(),
   };
 }
@@ -390,6 +431,8 @@ function saveUser(req, admin) {
   u.name = name;
   u.role = input.role;
   u.desk = clean(input.desk, 40);
+  u.title = clean(input.title, 40);
+  u.canCall = !!input.canCall;
   u.active = active;
   if (existing) writeRow('Users', u._row, cells('Users', u));
   else appendRows('Users', [cells('Users', u)]);
@@ -508,6 +551,296 @@ function summarize(ctx, from, to) {
   };
 }
 
+// ---------------------------------------------------------------- calls ("call office boy")
+
+function placeCall(req, user) {
+  if (!user.canCall) fail('Your admin hasn’t turned on calling for you.', 'role');
+  const features = loadFeatures();
+  const reason = str(req.reason);
+  if (features.callReasons.indexOf(reason) < 0) fail('Pick what you need.');
+  const note = features.allowCallNote ? clean(req.note, 120) : '';
+  const ctx = context();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) fail('The sheet is busy. Try again in a moment.');
+  let call;
+  try {
+    const waiting = todayCalls(ctx).filter(function (c) { return c.userId === user.id && CALL_ACTIVE.indexOf(c.status) >= 0; });
+    if (waiting.length >= 3) fail('You already have 3 calls waiting. Cancel one first.');
+    const stamp = new Date().toISOString();
+    call = { date: ctx.today, id: newId(), userId: user.id, reason: reason, note: note, status: 'open', createdAt: stamp, updatedAt: stamp, handledBy: '' };
+    appendRows('Calls', [cells('Calls', call)]);
+    bumpCalls();
+  } finally {
+    lock.releaseLock();
+  }
+  // Push after releasing the lock: it calls Firebase and can take a second.
+  const officeBoys = loadUsers().filter(function (u) { return u.active && u.role === 'officeboy'; }).map(function (u) { return u.id; });
+  const push = sendPush(officeBoys, {
+    title: '🔔 ' + callerLabel(user),
+    body: 'Needs ' + reason + (note ? ': ' + note : ''),
+    callId: call.id,
+    url: './#/calls',
+  });
+  const data = myCallsData(user, ctx);
+  data.push = push;
+  return data;
+}
+
+function myCalls(req, user) {
+  if (!user.canCall) fail('Your admin hasn’t turned on calling for you.', 'role');
+  return myCallsData(user, context());
+}
+
+function myCallsData(user, ctx) {
+  const names = userNames();
+  return {
+    serverNow: ctx.nowMs,
+    calls: todayCalls(ctx)
+      .filter(function (c) { return c.userId === user.id; })
+      .reverse()
+      .slice(0, 8)
+      .map(function (c) { return publicCall(c, names); }),
+  };
+}
+
+function cancelCall(req, user) {
+  const ctx = context();
+  const c = todayCalls(ctx).filter(function (x) { return x.id === req.id && x.userId === user.id; })[0];
+  if (!c) fail('Call not found.');
+  if (CALL_ACTIVE.indexOf(c.status) >= 0) setCallStatus(c, 'cancelled', '');
+  return myCallsData(user, ctx);
+}
+
+/** Office boy view. Pass `since` (last version seen) to get a tiny reply when nothing changed. */
+function callsBoard(req, user) {
+  const version = callsVersion();
+  if (req.since && req.since === version) return { unchanged: true, version: version, serverNow: Date.now() };
+  const ctx = context();
+  const names = userNames();
+  const all = todayCalls(ctx);
+  const active = all.filter(function (c) { return CALL_ACTIVE.indexOf(c.status) >= 0; });
+  const finished = all.filter(function (c) { return CALL_ACTIVE.indexOf(c.status) < 0; }).reverse().slice(0, 15);
+  return {
+    version: version,
+    serverNow: ctx.nowMs,
+    calls: active.concat(finished).map(function (c) { return publicCall(c, names); }),
+  };
+}
+
+function updateCall(req, user) {
+  if (['coming', 'done'].indexOf(req.status) < 0) fail('Invalid status.');
+  const ctx = context();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) fail('The sheet is busy. Try again in a moment.');
+  try {
+    const c = todayCalls(ctx).filter(function (x) { return x.id === req.id; })[0];
+    if (!c) fail('Call not found. Refresh.');
+    if (c.status === 'cancelled') fail('This call was cancelled.');
+    setCallStatus(c, req.status, user.id);
+  } finally {
+    lock.releaseLock();
+  }
+  return callsBoard({}, user);
+}
+
+function setCallStatus(c, status, handledBy) {
+  c.status = status;
+  c.updatedAt = new Date().toISOString();
+  if (handledBy) c.handledBy = handledBy;
+  writeRow('Calls', c._row, cells('Calls', c));
+  bumpCalls();
+}
+
+function todayCalls(ctx) {
+  return readSince('Calls', ctx.today, ctx)
+    .filter(function (c) { return toDate(c.date, ctx) === ctx.today; })
+    .map(function (c) {
+      return {
+        _row: c._row, date: toDate(c.date, ctx), id: str(c.id), userId: str(c.userId), reason: str(c.reason), note: str(c.note),
+        status: str(c.status), createdAt: str(c.createdAt), updatedAt: str(c.updatedAt), handledBy: str(c.handledBy),
+      };
+    });
+}
+
+function publicCall(c, names) {
+  const from = names[c.userId] || {};
+  return {
+    id: c.id, reason: c.reason, note: c.note, status: c.status, createdAt: c.createdAt, updatedAt: c.updatedAt,
+    from: { id: c.userId, name: from.name || '(removed)', title: from.title || '', desk: from.desk || '' },
+    handledBy: c.handledBy ? (names[c.handledBy] || {}).name || '' : '',
+  };
+}
+
+function userNames() {
+  const names = {};
+  loadUsers().forEach(function (u) { names[u.id] = { name: u.name, title: u.title, desk: u.desk }; });
+  return names;
+}
+
+function callerLabel(u) {
+  return u.name + (u.title || u.desk ? ' (' + [u.title, u.desk].filter(String).join(', ') + ')' : '');
+}
+
+function callsVersion() {
+  const cache = CacheService.getScriptCache();
+  let v = cache.get('callsVersion');
+  if (!v) {
+    v = newId();
+    cache.put('callsVersion', v, 21600);
+  }
+  return v;
+}
+
+function bumpCalls() {
+  CacheService.getScriptCache().put('callsVersion', newId(), 21600);
+}
+
+// ---------------------------------------------------------------- push notifications (Firebase Cloud Messaging)
+
+function registerDevice(req, user) {
+  const token = str(req.deviceToken);
+  if (token.length < 20 || token.length > 4096) fail('Invalid notification token.');
+  const existing = readTable('Devices').filter(function (d) { return str(d.token) === token; })[0];
+  const values = [user.id, token, clean(req.platform, 40), new Date().toISOString()];
+  if (existing) writeRow('Devices', existing._row, values);
+  else appendRows('Devices', [values]);
+  return { registered: true };
+}
+
+function testPush(req, user) {
+  const targets = req.target === 'officeboys' && user.role === 'admin'
+    ? loadUsers().filter(function (u) { return u.active && u.role === 'officeboy'; }).map(function (u) { return u.id; })
+    : [user.id];
+  return sendPush(targets, { title: 'OfficeBoy test 🔔', body: 'Notifications work on this phone.', callId: 'test', url: './#/' });
+}
+
+function saveFirebase(req, admin) {
+  const props = PropertiesService.getScriptProperties();
+  if (req.remove) {
+    setSetting('firebase', '');
+    props.deleteProperty('fcmServiceAccount');
+    CacheService.getScriptCache().remove('fcmToken');
+    return adminData(req, admin);
+  }
+  const c = req.config || {};
+  const config = { apiKey: clean(c.apiKey, 100), projectId: clean(c.projectId, 100), messagingSenderId: clean(c.messagingSenderId, 40), appId: clean(c.appId, 100) };
+  if (!config.apiKey || !config.projectId || !config.messagingSenderId || !config.appId) fail('The Firebase config needs apiKey, projectId, messagingSenderId and appId.');
+  const vapidKey = clean(req.vapidKey, 200);
+  if (vapidKey.length < 60) fail('Paste the Web Push certificate key (a long text starting with B).');
+
+  let sa = serviceAccount();
+  if (req.serviceAccount) {
+    try {
+      sa = JSON.parse(req.serviceAccount);
+    } catch (e) {
+      fail('The service account key is not valid JSON. Paste the whole downloaded file.');
+    }
+    if (!sa.client_email || !sa.private_key || !sa.project_id) fail('That JSON is not a service account key.');
+    sa = { client_email: sa.client_email, private_key: sa.private_key, project_id: sa.project_id };
+  }
+  if (!sa) fail('Add the service account key file.');
+  if (sa.project_id !== config.projectId) fail('The service account belongs to project “' + sa.project_id + '”, but the config is for “' + config.projectId + '”.');
+
+  CacheService.getScriptCache().remove('fcmToken');
+  fcmAccessToken(sa); // fails with a clear message if Google rejects the key
+  props.setProperty('fcmServiceAccount', JSON.stringify(sa));
+  setSetting('firebase', JSON.stringify({ config: config, vapidKey: vapidKey }));
+  return adminData(req, admin);
+}
+
+function firebasePublic() {
+  try {
+    const f = JSON.parse(getSetting('firebase') || 'null');
+    return f && f.config ? { config: f.config, vapidKey: f.vapidKey, ready: !!serviceAccount() } : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function serviceAccount() {
+  const raw = PropertiesService.getScriptProperties().getProperty('fcmServiceAccount');
+  return raw ? JSON.parse(raw) : null;
+}
+
+function serviceAccountEmail() {
+  const sa = serviceAccount();
+  return sa ? sa.client_email : '';
+}
+
+/** Best effort: never throws, so a Firebase problem can't block a call. */
+function sendPush(userIds, message) {
+  try {
+    const sa = serviceAccount();
+    if (!sa) return { sent: 0, reason: 'not-configured' };
+    const devices = readTable('Devices').filter(function (d) { return userIds.indexOf(str(d.userId)) >= 0 && str(d.token); });
+    if (!devices.length) return { sent: 0, reason: 'no-devices' };
+    const access = fcmAccessToken(sa);
+    const data = {};
+    Object.keys(message).forEach(function (k) { data[k] = String(message[k]); });
+    const responses = UrlFetchApp.fetchAll(devices.map(function (d) {
+      return {
+        url: 'https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(sa.project_id) + '/messages:send',
+        method: 'post',
+        contentType: 'application/json',
+        headers: { Authorization: 'Bearer ' + access },
+        muteHttpExceptions: true,
+        // Data-only message: the service worker shows the notification itself, the same way on Android and iOS.
+        payload: JSON.stringify({ message: { token: str(d.token), data: data, webpush: { headers: { Urgency: 'high', TTL: '900' } } } }),
+      };
+    }));
+    let sent = 0;
+    const dead = [];
+    responses.forEach(function (r, i) {
+      const code = r.getResponseCode();
+      if (code === 200) sent++;
+      else if (code === 404 || /UNREGISTERED/.test(r.getContentText())) dead.push(devices[i]._row);
+      else console.warn('FCM ' + code + ': ' + r.getContentText().slice(0, 300));
+    });
+    if (dead.length) {
+      const lock = LockService.getScriptLock();
+      if (lock.tryLock(5000)) {
+        try {
+          dead.sort(function (a, b) { return b - a; }).forEach(function (row) { sheet('Devices').deleteRow(row); });
+        } finally {
+          lock.releaseLock();
+        }
+      }
+    }
+    return { sent: sent, failed: devices.length - sent };
+  } catch (err) {
+    console.error(err && err.stack ? err.stack : err);
+    return { sent: 0, reason: 'error', error: String(err && err.message) };
+  }
+}
+
+function fcmAccessToken(sa) {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('fcmToken');
+  if (cached) return cached;
+  const now = Math.floor(Date.now() / 1000);
+  const b64 = function (v) { return Utilities.base64EncodeWebSafe(v).replace(/=+$/, ''); };
+  const unsigned = b64(JSON.stringify({ alg: 'RS256', typ: 'JWT' })) + '.' + b64(JSON.stringify({
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  }));
+  const signature = b64(Utilities.computeRsaSha256Signature(unsigned, sa.private_key));
+  const res = UrlFetchApp.fetch('https://oauth2.googleapis.com/token', {
+    method: 'post',
+    payload: { grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: unsigned + '.' + signature },
+    muteHttpExceptions: true,
+  });
+  let body = {};
+  try {
+    body = JSON.parse(res.getContentText());
+  } catch (e) {}
+  if (!body.access_token) fail('Google rejected the Firebase service account key (' + (body.error_description || body.error || res.getResponseCode()) + ').');
+  cache.put('fcmToken', body.access_token, 3300);
+  return body.access_token;
+}
+
 // ---------------------------------------------------------------- day model
 
 function loadDay(ctx) {
@@ -583,9 +916,9 @@ function loadFeatures() {
 function cleanFeatures(input) {
   const out = {};
   Object.keys(FEATURE_DEFAULTS).forEach(function (key) {
-    if (key === 'sugarOptions') {
-      const wanted = Array.isArray(input.sugarOptions) ? input.sugarOptions : FEATURE_DEFAULTS.sugarOptions;
-      out.sugarOptions = SUGAR_OPTIONS.filter(function (s) { return wanted.indexOf(s) >= 0; });
+    if (FEATURE_LISTS[key]) {
+      const wanted = Array.isArray(input[key]) ? input[key] : FEATURE_DEFAULTS[key];
+      out[key] = FEATURE_LISTS[key].filter(function (s) { return wanted.indexOf(s) >= 0; });
     } else {
       out[key] = input[key] === undefined ? FEATURE_DEFAULTS[key] : !!input[key];
     }
@@ -645,11 +978,23 @@ function setFinalized(ctx, roundIds) {
 // ---------------------------------------------------------------- tables
 
 function loadUsers() {
+  // Every request authenticates, so keep the Users tab in the script cache for a minute.
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('users:' + SCHEMA_VERSION);
+  if (cached) return JSON.parse(cached);
+  const users = readUsers();
+  try {
+    cache.put('users:' + SCHEMA_VERSION, JSON.stringify(users), 60);
+  } catch (e) {} // over the 100 KB cache limit: just read the sheet each time
+  return users;
+}
+
+function readUsers() {
   return readTable('Users').map(function (u) {
     return {
       _row: u._row, id: str(u.id), name: str(u.name), role: str(u.role), desk: str(u.desk), token: str(u.token),
       defaultDrink: str(u.defaultDrink), defaultSugar: str(u.defaultSugar), autoBook: bool(u.autoBook),
-      active: bool(u.active), createdAt: str(u.createdAt),
+      active: bool(u.active), createdAt: str(u.createdAt), title: str(u.title), canCall: bool(u.canCall),
     };
   });
 }
@@ -671,6 +1016,7 @@ function newUser(fields) {
   return {
     id: newId(), name: fields.name || '', role: fields.role || 'employee', desk: fields.desk || '', token: newToken(),
     defaultDrink: '', defaultSugar: '', autoBook: false, active: true, createdAt: new Date().toISOString(),
+    title: '', canCall: false,
   };
 }
 
@@ -736,12 +1082,18 @@ function readSince(name, fromDate, ctx) {
   return found.reverse();
 }
 
+function tableChanged(name) {
+  if (name === 'Users') CacheService.getScriptCache().remove('users:' + SCHEMA_VERSION);
+}
+
 function writeRow(name, row, values) {
+  tableChanged(name);
   sheet(name).getRange(row, 1, 1, values.length).setNumberFormat('@').setValues([values.map(cell)]);
 }
 
 function appendRows(name, rows) {
   if (!rows.length) return;
+  tableChanged(name);
   const sh = sheet(name);
   const start = sh.getLastRow() + 1;
   const needed = start + rows.length - 1 - sh.getMaxRows();

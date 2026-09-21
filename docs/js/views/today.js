@@ -1,4 +1,5 @@
 import { api } from '../api.js';
+import { mountCallCard } from './calls.js';
 import { h, fill, icon, loading, toast, openSheet, errorText, timeLabel, dateLabel, untilLabel, drinkLabel, greeting, poll } from '../ui.js';
 
 const AWAY = { wfh: 'working from home', leave: 'on leave' };
@@ -9,6 +10,8 @@ export async function renderToday(main, { onSession, onAuthError }) {
   let offset = 0; // server clock minus device clock
   let busy = null; // key of the action in progress
   let failed = null;
+  const callSlot = h('div', { class: 'stack' }); // kept across redraws; manages itself
+  let stopCallCard = null;
 
   const now = () => Date.now() + offset;
 
@@ -26,8 +29,17 @@ export async function renderToday(main, { onSession, onAuthError }) {
   }
 
   function apply(data) {
+    // Older Apps Script versions don't send feature flags: treat everything as on.
+    data.features = { showAttendance: true, allowAutoBook: true, allowRoundChange: true, showCountdown: true, callReasons: [], ...data.features };
     state = data;
     offset = data.serverNow - Date.now();
+    // Managers the admin allowed to call get the "Call office boy" card.
+    const canCall = data.user.canCall && data.features?.callReasons?.length > 0;
+    if (canCall && !stopCallCard) stopCallCard = mountCallCard(callSlot, { features: data.features, onAuthError });
+    if (!canCall && stopCallCard) {
+      stopCallCard();
+      stopCallCard = null;
+    }
     draw();
   }
 
@@ -62,6 +74,7 @@ export async function renderToday(main, { onSession, onAuthError }) {
         h('h1', {}, `${greeting()}, ${user.name.split(' ')[0]}`),
         h('p', { class: 'muted' }, dateLabel(state.today)),
       ),
+      stopCallCard && callSlot,
       state.features.showAttendance && attendanceCard(),
       !user.defaultDrink && h('section', { class: 'card soft' },
         h('h2', {}, 'Pick your usual drink'),
@@ -254,5 +267,8 @@ export async function renderToday(main, { onSession, onAuthError }) {
     if (ticks % 3 === 0) load();
     else if (state && !document.querySelector('.backdrop')) draw();
   }, 20000);
-  return stopPoll;
+  return () => {
+    stopPoll();
+    stopCallCard?.();
+  };
 }

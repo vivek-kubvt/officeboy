@@ -55,9 +55,10 @@ export async function renderPeople(main, ctx) {
               h('div', { class: 'row', style: 'gap:6px' },
                 h('span', { class: 'strong' }, u.name),
                 u.id === data.meId && h('span', { class: 'pill' }, 'You'),
+                u.canCall && h('span', { class: 'pill brand', title: 'Can call office boy' }, icon('bell'), 'Can call'),
               ),
               h('div', { class: 'muted small' },
-                [ROLE_NAMES[u.role], u.desk, u.active ? '' : 'Deactivated'].filter(Boolean).join(' · ')),
+                [u.title || ROLE_NAMES[u.role], u.desk, u.active ? '' : 'Deactivated'].filter(Boolean).join(' · ')),
             ),
             h('div', { class: 'actions' },
               u.active && h('button', { class: 'btn sm primary', onclick: () => share(u) }, icon('share'), 'Share link'),
@@ -115,7 +116,9 @@ export async function renderPeople(main, ctx) {
     const isNew = !user;
     const isMe = user?.id === data.meId;
     const name = h('input', { class: 'input', value: user?.name || '', maxlength: 60, placeholder: 'Full name', required: true });
-    const desk = h('input', { class: 'input', value: user?.desk || '', maxlength: 40, placeholder: 'e.g. 2nd floor, desk 14' });
+    const desk = h('input', { class: 'input', value: user?.desk || '', maxlength: 40, placeholder: 'e.g. 2nd floor, desk 14 or Cabin 1' });
+    const title = h('input', { class: 'input', value: user?.title || '', maxlength: 40, placeholder: 'e.g. CEO, HR Manager (optional)' });
+    const canCall = h('input', { type: 'checkbox', checked: !!user?.canCall });
     const role = h('select', { class: 'input', disabled: isMe },
       Object.entries(ROLE_NAMES).map(([value, label]) => h('option', { value, selected: (user?.role || 'employee') === value }, label)));
     const active = h('input', { type: 'checkbox', checked: user ? user.active : true, disabled: isMe });
@@ -131,7 +134,7 @@ export async function renderPeople(main, ctx) {
           error.hidden = true;
           withBusy(save, async () => {
             try {
-              data = await api('saveUser', { user: { id: user?.id, name: name.value, desk: desk.value, role: role.value, active: active.checked } });
+              data = await api('saveUser', { user: { id: user?.id, name: name.value, desk: desk.value, title: title.value, canCall: canCall.checked, role: role.value, active: active.checked } });
               close();
               draw();
               toast(isNew ? `${name.value.trim()} added. Now share their link.` : 'Saved');
@@ -146,7 +149,11 @@ export async function renderPeople(main, ctx) {
         h('div', { class: 'row between' }, h('h2', {}, isNew ? 'Add person' : `Edit ${user.name}`), h('button', { class: 'btn ghost', type: 'button', onclick: () => close() }, 'Cancel')),
         h('label', { class: 'field' }, h('span', {}, 'Name'), name),
         h('label', { class: 'field' }, h('span', {}, 'Role'), role),
-        h('label', { class: 'field' }, h('span', {}, 'Desk or floor (helps the office boy deliver)'), desk),
+        h('label', { class: 'field' }, h('span', {}, 'Job title'), title),
+        h('label', { class: 'field' }, h('span', {}, 'Desk, cabin or floor (helps the office boy deliver)'), desk),
+        h('label', { class: 'switch' }, canCall, h('span', {},
+          h('span', { class: 'strong' }, 'Can call office boy'),
+          h('span', { class: 'muted small', style: 'display:block' }, 'Shows a “Call office boy” button. His phone rings with their name, title and cabin.'))),
         !isNew && h('label', { class: 'switch' }, active, h('span', {}, h('span', { class: 'strong' }, 'Active'), h('span', { class: 'muted small', style: 'display:block' }, 'Deactivated people can’t open the app and aren’t counted.'))),
         error,
         save,
@@ -198,7 +205,7 @@ export async function renderSettings(main, ctx) {
         officeName: data.officeName,
         rounds: data.rounds.map((r) => ({ ...r })),
         menu: data.menu.map((m) => ({ ...m })),
-        features: { ...data.features, sugarOptions: [...data.features.sugarOptions] },
+        features: { ...data.features, sugarOptions: [...(data.features?.sugarOptions || [])], callReasons: [...(data.features?.callReasons || [])] },
       };
       draw();
     } catch (err) {
@@ -274,6 +281,8 @@ export async function renderSettings(main, ctx) {
       error,
       save,
 
+      firebaseCard(),
+
       h('div', { class: 'section-title' }, 'Account'),
       passwordCard(),
       h('section', { class: 'card flat' },
@@ -326,9 +335,104 @@ export async function renderSettings(main, ctx) {
       toggle('allowRoundChange', 'Let people change drink per round', 'When off, every booking is their usual drink.'),
       toggle('allowAutoBook', 'Allow auto-book', 'People can be counted in automatically with their usual drink.'),
       toggle('showCountdown', 'Show booking countdown', '“Booking closes at 10:30 · 20 min left”.'),
+      h('div', { class: 'section-title' }, 'Calling the office boy'),
+      h('div', { class: 'stack', style: 'gap:6px' },
+        h('span', { class: 'strong' }, 'Call reasons'),
+        h('div', { class: 'chips' }, (data.callReasons || []).map((option) => h('button', {
+          class: 'chip', 'aria-pressed': String(f.callReasons.includes(option)),
+          onclick: (e) => {
+            f.callReasons = f.callReasons.includes(option)
+              ? f.callReasons.filter((x) => x !== option)
+              : (data.callReasons || []).filter((x) => x === option || f.callReasons.includes(x));
+            e.currentTarget.setAttribute('aria-pressed', String(f.callReasons.includes(option)));
+          },
+        }, option))),
+        h('span', { class: 'muted small' }, 'Choose who can call in People → Edit → “Can call office boy”. Turn all reasons off to hide calling.'),
+      ),
+      toggle('allowCallNote', 'Allow a note with a call', 'e.g. “2 guests” or “bring biscuits”.'),
       h('div', { class: 'section-title' }, 'Office boy screen'),
       toggle('showNoReply', 'Show “No reply yet” list', 'Names of people who haven’t answered today.'),
       toggle('officeBoyHistory', 'Show History tab', 'Cups and headcount for the last 14 days.'),
+    );
+  }
+
+  function firebaseCard() {
+    const fb = data.firebase;
+    const ready = fb?.ready;
+    const configInput = h('textarea', { class: 'input mono', rows: 6, placeholder: 'const firebaseConfig = {\n  apiKey: "…",\n  projectId: "…",\n  messagingSenderId: "…",\n  appId: "…"\n};' });
+    if (fb?.config) configInput.value = JSON.stringify(fb.config, null, 2);
+    const vapidInput = h('input', { class: 'input mono', placeholder: 'BPx… (Web Push certificate key pair)', value: fb?.vapidKey || '' });
+    let serviceAccount = '';
+    const fileLabel = h('span', { class: 'muted small' }, ready ? `Saved: ${data.pushServiceAccount}. Choose a file only to replace it.` : 'No file chosen');
+    const fileInput = h('input', {
+      type: 'file', accept: '.json,application/json', class: 'file-input',
+      onchange: async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        serviceAccount = await file.text();
+        fileLabel.textContent = file.name;
+      },
+    });
+    const error = h('div', { class: 'notice error', hidden: true });
+    const save = h('button', {
+      class: 'btn primary',
+      onclick: () => withBusy(save, async () => {
+        error.hidden = true;
+        try {
+          data = await api('saveFirebase', { config: parseFirebaseConfig(configInput.value), vapidKey: vapidInput.value.trim(), serviceAccount });
+          toast('Phone notifications connected');
+          draw();
+        } catch (err) {
+          if (ctx.onAuthError(err)) return;
+          error.textContent = errorText(err);
+          error.hidden = false;
+        }
+      }),
+    }, ready ? 'Update' : 'Connect Firebase');
+
+    return h('section', { class: 'card' },
+      h('div', { class: 'row between wrap' },
+        h('div', {},
+          h('h2', {}, 'Phone notifications (Firebase)'),
+          h('p', { class: 'muted small' }, 'Optional. Lets calls ring the office boy’s phone even when the app is closed. Free with a Firebase project.'),
+        ),
+        h('span', { class: `pill ${ready ? 'ok' : ''}` }, ready ? 'Connected ✓' : 'Not set up'),
+      ),
+      h('details', { class: 'guide', open: !ready },
+        h('summary', { class: 'strong' }, 'How to set it up (about 5 minutes)'),
+        h('ol', { class: 'steps' },
+          h('li', {}, 'Open ', h('a', { href: 'https://console.firebase.google.com/', target: '_blank', rel: 'noopener' }, 'console.firebase.google.com'), ' → Add project (Google Analytics not needed).'),
+          h('li', {}, 'Project settings (⚙) → General → Your apps → Web (</>) → register any name → copy the ', h('code', {}, 'firebaseConfig'), ' block into box 1.'),
+          h('li', {}, 'Project settings → Cloud Messaging → Web Push certificates → Generate key pair → copy the key into box 2.'),
+          h('li', {}, 'Project settings → Service accounts → Generate new private key → choose that downloaded file in box 3. It is stored only in your Apps Script, never in the sheet.'),
+          h('li', {}, 'In Apps Script, run ', h('code', {}, 'install'), ' once more and allow the new “connect to an external service” permission, then Deploy → Manage deployments → New version.'),
+        ),
+      ),
+      h('label', { class: 'field' }, h('span', {}, '1. Firebase config'), configInput),
+      h('label', { class: 'field' }, h('span', {}, '2. Web Push certificate key'), vapidInput),
+      h('div', { class: 'field' }, h('span', {}, '3. Service account key (.json file)'),
+        h('label', { class: 'btn sm file-btn' }, fileInput, 'Choose file'), fileLabel),
+      error,
+      h('div', { class: 'row wrap' },
+        save,
+        ready && h('button', {
+          class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
+            try {
+              const r = await api('testPush', { target: 'officeboys' });
+              toast(r.sent ? `Test sent to ${r.sent} phone${r.sent === 1 ? '' : 's'}` : r.reason === 'no-devices' ? 'No office boy phone has turned on notifications yet (Calls tab → Turn on notifications).' : 'Test failed. Check the Apps Script execution log.', r.sent ? '' : 'error');
+            } catch (err) { toast(errorText(err), 'error'); }
+          }),
+        }, 'Send test to office boy'),
+        ready && h('button', {
+          class: 'btn ghost danger', onclick: async () => {
+            if (!(await confirmSheet({ title: 'Disconnect Firebase?', message: 'Calls will only ring while the office boy’s app is open.', confirm: 'Disconnect', danger: true }))) return;
+            try {
+              data = await api('saveFirebase', { remove: true });
+              draw();
+            } catch (err) { toast(errorText(err), 'error'); }
+          },
+        }, 'Disconnect'),
+      ),
     );
   }
 
@@ -364,6 +468,16 @@ export async function renderSettings(main, ctx) {
   }
 
   await load();
+}
+
+/** Accepts the JS snippet from the Firebase console or plain JSON. */
+function parseFirebaseConfig(text) {
+  try {
+    return JSON.parse(text);
+  } catch {}
+  const config = {};
+  for (const [, key, value] of String(text).matchAll(/(\w+)\s*:\s*["'`]([^"'`]+)["'`]/g)) config[key] = value;
+  return config;
 }
 
 // ------------------------------------------------------------------ reports

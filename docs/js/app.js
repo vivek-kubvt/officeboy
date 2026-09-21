@@ -1,6 +1,8 @@
 import { api, session, parseInviteLink } from './api.js';
 import { h, icon, loading, errorText } from './ui.js';
-import { renderWelcome, renderSetup, renderLinkProblem, renderSwitchAccount } from './views/start.js';
+import { renderWelcome, renderSetup, renderLinkProblem, renderSwitchAccount, renderInstall } from './views/start.js';
+import { renderCalls, setCallWatcher } from './views/calls.js';
+import { isMobile, isStandalone, canPromptInstall, promptInstall, onInstallChange } from './platform.js';
 import { renderToday } from './views/today.js';
 import { renderBoard, renderHistory } from './views/board.js';
 import { renderPeople, renderReports, renderSettings } from './views/admin.js';
@@ -8,7 +10,8 @@ import { renderPeople, renderReports, renderSettings } from './views/admin.js';
 const TABS = {
   employee: [{ id: 'today', label: 'Today', icon: 'cup', render: renderToday }],
   officeboy: [
-    { id: 'board', label: 'Live', icon: 'list', render: renderBoard },
+    { id: 'calls', label: 'Calls', icon: 'bell', render: renderCalls },
+    { id: 'board', label: 'Orders', icon: 'list', render: renderBoard },
     { id: 'history', label: 'History', icon: 'calendar', render: renderHistory, when: (f) => f?.officeBoyHistory !== false },
   ],
   admin: [
@@ -21,8 +24,8 @@ const TABS = {
 };
 
 const root = document.getElementById('app');
+const MIN_BACKEND = 2; // must match BACKEND_VERSION in apps-script/Code.gs
 let cleanup = null;
-let installPrompt = null;
 
 function parseHash() {
   const raw = location.hash.replace(/^#\/?/, '');
@@ -76,8 +79,20 @@ async function join(fromSession = false) {
   session.set({ backend: invite.backend, token: invite.token });
   try {
     const me = await api('me');
-    session.set({ backend: invite.backend, token: invite.token, role: me.user.role, name: me.user.name, officeName: me.officeName, features: me.features });
-    showShell(session.get(), fromSession ? parseHash() : TABS[me.user.role][0].id);
+    session.set({ backend: invite.backend, token: invite.token, role: me.user.role, name: me.user.name, title: me.user.title, officeName: me.officeName, features: me.features });
+    const home = TABS[me.user.role][0].id;
+    // First open on a phone: ask them to install before anything else.
+    if (!fromSession && isMobile && !isStandalone() && !sessionStorage.getItem('ob.skipInstall')) {
+      return mount(renderInstall, {
+        name: me.user.name,
+        link: location.href,
+        onContinue: () => {
+          sessionStorage.setItem('ob.skipInstall', '1');
+          navigate(home);
+        },
+      });
+    }
+    showShell(session.get(), fromSession ? parseHash() : home);
   } catch (err) {
     if (err.code === 'auth') {
       if (previous && previous.token !== invite.token) session.set(previous);
@@ -96,12 +111,12 @@ function showShell(s, path) {
   const wide = ['people', 'reports', 'settings'].includes(tab.id);
 
   const main = h('main', { class: `main${wide ? ' wide' : ''}${tabs.length < 2 ? ' no-nav' : ''}` }, loading());
-  const installBtn = h('button', { class: 'btn sm', hidden: !installPrompt, onclick: install }, 'Install');
+  const installBtn = h('button', { class: 'btn sm', hidden: !canPromptInstall(), onclick: () => promptInstall() }, 'Install');
   const topbar = h('header', { class: 'topbar' },
     h('img', { src: 'icons/icon-192.png', alt: '' }),
     h('div', { class: 'title' },
       h('strong', {}, s.officeName || 'OfficeBoy'),
-      h('span', {}, s.name ? `${s.name} · ${roleName(s.role)}` : roleName(s.role)),
+      h('span', {}, s.name ? `${s.name} · ${s.title || roleName(s.role)}` : roleName(s.role)),
     ),
     installBtn,
   );
@@ -111,6 +126,7 @@ function showShell(s, path) {
     : null;
 
   root.replaceChildren(h('div', { class: 'app' }, topbar, main, nav));
+  setCallWatcher(s.role === 'officeboy', { onAuthError: handleAuthError });
   document.title = `${tab.label} · OfficeBoy`;
   window.scrollTo(0, 0);
 
@@ -118,10 +134,15 @@ function showShell(s, path) {
     // Keep header and role in sync with the sheet (admin may rename or change someone's role).
     const now = session.get();
     if (!now || !me?.user) return;
+    if (me.user.role === 'admin' && (me.backendVersion || 1) < MIN_BACKEND && !main.querySelector('.update-notice')) {
+      main.prepend(h('div', { class: 'notice update-notice' },
+        h('strong', {}, 'Update your Apps Script. '),
+        'This app is newer than your sheet’s script, so calls and phone notifications won’t work yet. Paste the latest Code.gs from GitHub, run “install” once, then Deploy → Manage deployments → New version.'));
+    }
     const changedLayout = me.user.role !== now.role || JSON.stringify(me.features) !== JSON.stringify(now.features);
-    session.update({ name: me.user.name, role: me.user.role, officeName: me.officeName, features: me.features });
+    session.update({ name: me.user.name, role: me.user.role, title: me.user.title, officeName: me.officeName, features: me.features });
     if (changedLayout) route();
-    else topbar.querySelector('.title').replaceChildren(h('strong', {}, me.officeName || 'OfficeBoy'), h('span', {}, `${me.user.name} · ${roleName(me.user.role)}`));
+    else topbar.querySelector('.title').replaceChildren(h('strong', {}, me.officeName || 'OfficeBoy'), h('span', {}, `${me.user.name} · ${me.user.title || roleName(me.user.role)}`));
   };
 
   const result = tab.render(main, { session: s, onSession, onAuthError: handleAuthError, navigate });
@@ -147,6 +168,7 @@ function handleAuthError(err) {
 }
 
 function mount(render, props = {}) {
+  setCallWatcher(false);
   root.replaceChildren();
   const result = render(root, { ...props, navigate, route });
   Promise.resolve(result).then((fn) => {
@@ -158,18 +180,8 @@ export function roleName(role) {
   return { admin: 'Admin', employee: 'Employee', officeboy: 'Office boy' }[role] || '';
 }
 
-async function install() {
-  if (!installPrompt) return;
-  installPrompt.prompt();
-  await installPrompt.userChoice;
-  installPrompt = null;
-  document.querySelectorAll('.topbar .btn').forEach((b) => (b.hidden = true));
-}
-
-window.addEventListener('beforeinstallprompt', (e) => {
-  e.preventDefault();
-  installPrompt = e;
-  document.querySelectorAll('.topbar .btn').forEach((b) => (b.hidden = false));
+onInstallChange(() => {
+  document.querySelectorAll('.topbar .btn').forEach((b) => (b.hidden = !canPromptInstall()));
 });
 window.addEventListener('hashchange', route);
 

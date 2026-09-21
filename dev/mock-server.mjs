@@ -9,7 +9,7 @@
 
 import { createServer } from 'node:http';
 import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createSign, randomUUID } from 'node:crypto';
 import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
@@ -62,6 +62,7 @@ class Sheet {
   }
   getMaxRows() { return this.store.maxRows; }
   insertRowsAfter(_, n) { this.store.maxRows += n; }
+  deleteRow(row) { this.data.splice(row - 1, 1); }
   getRange(row, col, rows = 1, cols = 1) { return new Range(this, row, col, rows, cols); }
   setFrozenRows() {}
 }
@@ -92,12 +93,15 @@ const services = {
     computeDigest: (alg, value) => [...createHash(alg).update(value, 'utf8').digest()].map((b) => (b > 127 ? b - 256 : b)),
     getUuid: () => randomUUID(),
     formatDate,
+    base64EncodeWebSafe: (v) => Buffer.from(typeof v === 'string' ? Buffer.from(v, 'utf8') : Uint8Array.from(v, (b) => b & 255)).toString('base64url'),
+    computeRsaSha256Signature: (input, key) => [...createSign('RSA-SHA256').update(input).sign(key)].map((b) => (b > 127 ? b - 256 : b)),
   },
   PropertiesService: {
     getScriptProperties: () => ({
       getProperty: (k) => db.props[k] ?? null,
       setProperty: (k, v) => { db.props[k] = String(v); },
       setProperties: (o) => Object.entries(o).forEach(([k, v]) => { db.props[k] = String(v); }),
+      deleteProperty: (k) => { delete db.props[k]; },
     }),
   },
   CacheService: {
@@ -112,6 +116,14 @@ const services = {
     MimeType: { JSON: 'json' },
     createTextOutput: (text) => ({ text, setMimeType() { return this; } }),
   },
+  // Firebase is faked: no network calls. Every push is logged and counted as delivered.
+  UrlFetchApp: {
+    fetch: (url) => ({ getResponseCode: () => 200, getContentText: () => JSON.stringify(url.includes('oauth2') ? { access_token: 'mock-access-token' } : {}) }),
+    fetchAll: (requests) => requests.map((r) => {
+      console.log('[mock push]', JSON.parse(r.payload).message.data);
+      return { getResponseCode: () => 200, getContentText: () => '{}' };
+    }),
+  },
   ScriptApp: {
     getProjectTriggers: () => [],
     newTrigger: () => ({ timeBased: () => ({ everyMinutes: () => ({ create: () => {} }) }) }),
@@ -122,7 +134,7 @@ const services = {
 function runScript(fnName, arg) {
   // Fresh context per request, like Apps Script (module-level caches reset each execution).
   const context = vm.createContext({ ...services });
-  vm.runInContext(readFileSync(join(ROOT, 'apps-script', 'Code.gs'), 'utf8'), context, { filename: 'Code.gs' });
+  vm.runInContext(readFileSync(process.env.MOCK_CODE || join(ROOT, 'apps-script', 'Code.gs'), 'utf8'), context, { filename: 'Code.gs' });
   const result = context[fnName](arg);
   save();
   return result;

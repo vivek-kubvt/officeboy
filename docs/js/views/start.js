@@ -1,5 +1,6 @@
 import { call, session, parseBackendUrl, parseInviteLink } from '../api.js';
-import { h, withBusy, errorText, toast } from '../ui.js';
+import { h, icon, withBusy, errorText, toast } from '../ui.js';
+import { isIOS, isAndroid, isInAppBrowser, isStandalone, canPromptInstall, promptInstall, onInstallChange, markInstalledHint, copyText } from '../platform.js';
 import { SETUP_GUIDE_URL } from '../config.js';
 
 function page(...children) {
@@ -26,20 +27,34 @@ function showError(box, err) {
 export function renderWelcome(root, { navigate }) {
   const input = h('input', { class: 'input', placeholder: 'Paste your OfficeBoy link', autocomplete: 'off', inputmode: 'url' });
   const error = errorBox();
-  const open = () => {
-    const invite = parseInviteLink(input.value);
+  const openLink = (text) => {
+    const invite = parseInviteLink(text);
     if (!invite) return showError(error, { message: 'That doesn’t look like an OfficeBoy link. Copy the whole link from your admin’s message.' });
-    location.href = `${location.pathname}${input.value.slice(input.value.indexOf('#/j?'))}`;
+    location.href = `${location.pathname}${text.trim().slice(text.trim().indexOf('#/j?'))}`;
   };
+  const paste = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      input.value = text;
+      openLink(text);
+    } catch {
+      input.focus();
+      showError(error, { message: 'Couldn’t read the clipboard. Long-press the box above and tap Paste.' });
+    }
+  };
+  const installed = isStandalone();
 
   root.append(page(
-    hero('OfficeBoy', 'Tea and coffee orders for your office.'),
+    hero(installed ? 'Welcome to OfficeBoy' : 'OfficeBoy', installed ? 'One last step: paste the link you copied.' : 'Tea and coffee orders for your office.'),
     h('section', { class: 'card' },
-      h('h2', {}, 'Got a link from your admin?'),
-      h('p', { class: 'muted small' }, 'Open the link from your WhatsApp, Slack or email message. If this app opened without it, paste the link here once.'),
+      h('h2', {}, installed ? 'Paste your link' : 'Got a link from your admin?'),
+      h('p', { class: 'muted small' }, installed
+        ? 'You only need to do this once. Your link is still on the clipboard if you tapped “Copy my link”. If not, copy it again from your admin’s message.'
+        : 'Open the link from your WhatsApp, Slack or email message. If this app opened without it, paste the link here once.'),
+      navigator.clipboard?.readText && h('button', { class: 'btn primary big block', onclick: paste }, icon('copy'), 'Paste my link'),
       input,
       error,
-      h('button', { class: 'btn primary block', onclick: open }, 'Open my link'),
+      h('button', { class: `btn ${navigator.clipboard?.readText ? '' : 'primary '}block`, onclick: () => openLink(input.value) }, 'Open my link'),
     ),
     h('section', { class: 'card flat' },
       h('h2', {}, 'Admin'),
@@ -85,6 +100,16 @@ export function renderSetup(root, { navigate, route }) {
         h('li', {}, 'Run the ', h('code', {}, 'install'), ' function once and allow access.'),
         h('li', {}, 'Deploy → New deployment → Web app. Execute as: Me. Who has access: Anyone.'),
         h('li', {}, 'Copy the web app URL and paste it below.'),
+      ),
+      h('details', { class: 'guide' },
+        h('summary', { class: 'small strong' }, 'Optional: ring the office boy’s phone when the app is closed'),
+        h('p', { class: 'muted small' }, 'Uses a free Firebase project. You can add it any time later in Settings → Phone notifications, which shows every step:'),
+        h('ol', { class: 'steps muted' },
+          h('li', {}, 'Create a Firebase project and add a Web app. Copy its config.'),
+          h('li', {}, 'Cloud Messaging → Web Push certificates → Generate key pair.'),
+          h('li', {}, 'Service accounts → Generate new private key (a .json file).'),
+          h('li', {}, 'Paste all three into Settings → Phone notifications.'),
+        ),
       ),
       SETUP_GUIDE_URL && h('a', { href: SETUP_GUIDE_URL, target: '_blank', rel: 'noopener', class: 'small' }, 'Step-by-step setup guide'),
       h('label', { class: 'field' }, h('span', {}, 'Web app URL'), input),
@@ -170,6 +195,99 @@ export function renderSetup(root, { navigate, route }) {
     h('button', { class: 'btn ghost', onclick: () => navigate('') }, 'Back'),
   ));
   stepUrl();
+}
+
+/** Shown after someone opens their personal link in a phone browser: install the app first. */
+export function renderInstall(root, { name, link, onContinue }) {
+  const firstName = String(name || '').split(' ')[0];
+  const body = h('div', { class: 'stack', style: 'gap:14px' });
+  let copied = false;
+  let installed = false;
+
+  const copyButton = (primary) => h('button', {
+    class: `btn ${primary ? 'primary' : ''} block`,
+    onclick: async () => {
+      copied = await copyText(link);
+      toast(copied ? 'Link copied' : 'Couldn’t copy. Copy the link from your message instead.', copied ? '' : 'error');
+      draw();
+    },
+  }, icon(copied ? 'check' : 'copy'), copied ? 'Link copied' : 'Copy my link');
+
+  const step = (n, title, detail, extra) => h('li', { class: 'install-step' },
+    h('span', { class: 'step-num' }, n),
+    h('div', { class: 'grow stack', style: 'gap:6px' }, h('div', { class: 'strong' }, title), detail && h('div', { class: 'muted small' }, detail), extra),
+  );
+
+  function draw() {
+    if (isInAppBrowser) {
+      fill(
+        h('section', { class: 'card' },
+          h('div', { class: 'notice' }, 'This link opened inside another app (like WhatsApp). Apps can only be installed from ', isIOS ? 'Safari.' : 'Chrome.'),
+          h('ol', { class: 'install-steps' },
+            step(1, 'Copy your link', null, copyButton(true)),
+            isIOS
+              ? step(2, 'Open it in Safari', 'Tap ••• or the compass icon and choose “Open in Safari”. Or open Safari and paste the link.')
+              : step(2, 'Open it in Chrome', 'Tap ⋮ at the top and choose “Open in Chrome”. Or open Chrome and paste the link.'),
+            step(3, 'Install from there', 'You’ll see the install steps again.'),
+          ),
+        ),
+      );
+      return;
+    }
+    if (isIOS) {
+      fill(
+        h('section', { class: 'card' },
+          h('ol', { class: 'install-steps' },
+            step(1, 'Copy your link', 'You’ll paste it once when the app opens for the first time.', copyButton(!copied)),
+            step(2, h('span', {}, 'Tap the Share button ', h('span', { class: 'inline-icon' }, icon('share'))), 'At the bottom of Safari (top right on iPad, or in the address bar in Chrome).'),
+            step(3, h('span', {}, 'Tap “Add to Home Screen” ', h('span', { class: 'inline-icon' }, icon('addSquare'))), 'Scroll down the list if you don’t see it. Then tap Add.'),
+            step(4, 'Open OfficeBoy from your home screen', 'Tap “Paste my link”. That’s it: you stay signed in.'),
+          ),
+        ),
+      );
+      return;
+    }
+    if (installed) {
+      fill(h('section', { class: 'card soft center' },
+        h('h2', {}, 'Installed ✓'),
+        h('p', {}, 'Open OfficeBoy from your home screen. You’re already signed in.'),
+      ));
+      return;
+    }
+    if (canPromptInstall()) {
+      fill(h('section', { class: 'card' },
+        h('button', {
+          class: 'btn primary big block',
+          onclick: async () => {
+            installed = await promptInstall();
+            draw();
+          },
+        }, icon('phone'), 'Install app'),
+        h('p', { class: 'muted small center' }, 'Free, about 1 MB. No Play Store needed.'),
+      ));
+      return;
+    }
+    fill(h('section', { class: 'card' },
+      markInstalledHint() && h('div', { class: 'notice' }, 'Looks like it’s already installed. Open OfficeBoy from your home screen.'),
+      h('ol', { class: 'install-steps' },
+        step(1, h('span', {}, 'Tap the menu ', h('span', { class: 'inline-icon' }, icon('dots'))), 'Top right corner in Chrome.'),
+        step(2, 'Tap “Install app” or “Add to Home screen”', isAndroid ? 'Then tap Install.' : 'Use Chrome, Edge or Samsung Internet.'),
+        step(3, 'Open OfficeBoy from your home screen', 'You’re already signed in.'),
+      ),
+    ));
+  }
+
+  function fill(...children) {
+    body.replaceChildren(...children.filter(Boolean));
+  }
+
+  root.append(page(
+    hero(`Hi ${firstName}, install OfficeBoy`, 'Add it to your home screen. It opens like an app and stays signed in.'),
+    body,
+    h('button', { class: 'btn ghost', onclick: onContinue }, 'Continue in the browser for now'),
+  ));
+  draw();
+  return onInstallChange(draw);
 }
 
 export function renderLinkProblem(root, { message, retry, navigate }) {
